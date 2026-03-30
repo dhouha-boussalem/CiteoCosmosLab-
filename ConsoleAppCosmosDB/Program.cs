@@ -1,6 +1,8 @@
-﻿using CiteoCosmosLab.Models;
+﻿using CiteoCosmosLab.Data;
+using CiteoCosmosLab.Models;
 using CiteoCosmosLab.Repositories;
 using Microsoft.Azure.Cosmos;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -33,6 +35,28 @@ builder.Services.AddSingleton<CosmosClient>(_ =>
 });
 
 builder.Services.AddScoped<IOrderRepository, CosmosOrderRepository>();
+builder.Services.AddDbContext<CiteoDbContext>(options =>
+{       
+    options.UseCosmos(
+        accountEndpoint: "https://127.0.0.1:8081",
+        accountKey: "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
+        databaseName: "CiteoDb",
+        cosmosOptionsAction: cosmosBuilder =>
+        {
+            cosmosBuilder.HttpClientFactory(() =>
+            {
+                var handler = new HttpClientHandler 
+                {
+                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+                };
+                return new HttpClient(handler, disposeHandler: false);
+            });
+            cosmosBuilder.ConnectionMode(ConnectionMode.Gateway);
+            cosmosBuilder.LimitToEndpoint();
+        }
+    );
+    options.UseCamelCaseNamingConvention();
+});
 
 var app = builder.Build();
 
@@ -46,6 +70,9 @@ try
     Console.WriteLine("Database créée !");
     await database.Database.CreateContainerIfNotExistsAsync("Orders", "/clientId");
     Console.WriteLine("Container créé !");
+    var dbContext = scope.ServiceProvider.GetRequiredService<CiteoDbContext>();
+    await dbContext.Database.EnsureCreatedAsync();
+    Console.WriteLine("EF Core initialisé !");
 }
 catch (Exception ex)
 {
@@ -90,5 +117,36 @@ app.MapDelete("/orders/{id}", async (string id, string clientId, IOrderRepositor
     await repo.DeleteAsync(id, clientId);
     return Results.NoContent();
 });
+
+
+// --- Endpoints EF Core (pour comparer avec le SDK direct) ---
+
+app.MapPost("/ef/orders", async (Order order, CiteoDbContext db) =>
+{
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();
+    return Results.Created($"/ef/orders/{order.Id}", order);
+});
+
+app.MapGet("/ef/orders/client/{clientId}", async (string clientId, CiteoDbContext db) =>
+{
+    var orders = await db.Orders
+        .Where(o => o.ClientId == clientId)
+        .OrderByDescending(o => o.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(orders);
+});
+
+app.MapGet("/ef/orders/{id}", async (string id, string clientId, CiteoDbContext db) =>
+{
+    // WithPartitionKey = indique à EF Core dans quelle partition chercher
+    var order = await db.Orders
+        .WithPartitionKey(clientId)
+        .FirstOrDefaultAsync(o => o.Id == id);
+
+    return order is not null ? Results.Ok(order) : Results.NotFound();
+});
+
 
 app.Run();
