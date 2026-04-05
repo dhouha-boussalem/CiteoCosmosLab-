@@ -3,6 +3,7 @@ using CiteoCosmosLab.Models;
 using CiteoCosmosLab.Repositories;
 using Microsoft.Azure.Cosmos;
 using Microsoft.EntityFrameworkCore;
+using CiteoCosmosLab.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -33,6 +34,7 @@ builder.Services.AddSingleton<CosmosClient>(_ =>
         }
     );
 });
+builder.Services.AddHostedService<OrderChangeFeedService>();
 
 builder.Services.AddScoped<IOrderRepository, CosmosOrderRepository>();
 builder.Services.AddDbContext<CiteoDbContext>(options =>
