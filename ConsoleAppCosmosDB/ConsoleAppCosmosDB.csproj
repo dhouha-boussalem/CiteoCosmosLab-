@@ -7,8 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="EFCore.NamingConventions" Version="10.0.1" />
     <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.57.1" />
     <PackageReference Include="Microsoft.Azure.Cosmos.Table" Version="1.0.8" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Cosmos" Version="10.0.5" />
   </ItemGroup>
 
 </Project>
