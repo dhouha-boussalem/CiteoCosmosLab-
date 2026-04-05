@@ -149,4 +149,36 @@ app.MapGet("/ef/orders/{id}", async (string id, string clientId, CiteoDbContext 
 });
 
 
+// POST /orders/submit — Créer une commande + un audit log en une seule transaction
+app.MapPost("/orders/submit", async (Order order, CosmosClient cosmosClient) =>
+{
+    var container = cosmosClient.GetContainer("CiteoDb", "Orders");
+
+    order.Status = "Submitted";
+
+    var audit = new AuditLog
+    {
+        ClientId = order.ClientId,
+        OrderId = order.Id,
+        Action = "Submitted"
+    };
+
+    // Transactional Batch : tout passe ou tout échoue
+    var batch = container.CreateTransactionalBatch(new PartitionKey(order.ClientId))
+        .CreateItem(order)
+        .CreateItem(audit);
+
+    var batchResponse = await batch.ExecuteAsync();
+
+    if (batchResponse.IsSuccessStatusCode)
+    {
+        Console.WriteLine($"Batch: {batchResponse.RequestCharge} RU");
+        return Results.Created($"/orders/{order.Id}", order);
+    }
+    else
+    {
+        return Results.Problem($"Batch failed: {batchResponse.StatusCode}");
+    }
+});
+
 app.Run();
