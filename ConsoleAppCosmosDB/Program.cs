@@ -5,6 +5,13 @@ using Microsoft.Azure.Cosmos;
 using Microsoft.EntityFrameworkCore;
 using CiteoCosmosLab.Services;
 
+using System.Text;
+using System.Security.Claims;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using User = CiteoCosmosLab.Models.User;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // --- Cosmos DB : enregistrement du client en Singleton ---
@@ -34,7 +41,7 @@ builder.Services.AddSingleton<CosmosClient>(_ =>
         }
     );
 });
-builder.Services.AddHostedService<OrderChangeFeedService>();
+//builder.Services.AddHostedService<OrderChangeFeedService>();
 
 builder.Services.AddScoped<IOrderRepository, CosmosOrderRepository>();
 builder.Services.AddDbContext<CiteoDbContext>(options =>
@@ -60,7 +67,29 @@ builder.Services.AddDbContext<CiteoDbContext>(options =>
     options.UseCamelCaseNamingConvention();
 });
 
+// --- JWT Configuration ---
+var jwtKey = "MaCleSecreteSuperLongue-MinimumTrentaDeuxCaracteres!";
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "CiteoPortal",
+            ValidAudience = "CiteoClients",
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+builder.Services.AddAuthorization();
 var app = builder.Build();
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 // --- Initialisation : créer la database et le container au démarrage ---
 try
@@ -182,5 +211,93 @@ app.MapPost("/orders/submit", async (Order order, CosmosClient cosmosClient) =>
         return Results.Problem($"Batch failed: {batchResponse.StatusCode}");
     }
 });
+
+// POST /auth/register — Créer un utilisateur
+app.MapPost("/auth/register", async (LoginRequest request, CosmosClient cosmosClient) =>
+{
+    var container = cosmosClient.GetContainer("CiteoDb", "Orders");
+
+    var user = new CiteoCosmosLab.Models.User
+    {
+        ClientId = "client-001", // en vrai, assigné par l'admin
+        Username = request.Username,
+        PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
+        Role = "User"
+    };
+
+    await container.CreateItemAsync(user, new PartitionKey(user.ClientId));
+    return Results.Created($"/users/{user.Id}", new { user.Id, user.Username });
+});
+
+// POST /auth/login — Vérifie en base et retourne JWT + refresh token
+app.MapPost("/auth/login", async (LoginRequest request, CosmosClient cosmosClient) =>
+{
+    var container = cosmosClient.GetContainer("CiteoDb", "Orders");
+
+    // Cherche l'utilisateur par username
+    var query = new QueryDefinition(
+        "SELECT * FROM c WHERE c.type = 'User' AND c.username = @username")
+        .WithParameter("@username", request.Username);
+
+    var iterator = container.GetItemQueryIterator<User>(query);
+    User? user = null;
+
+    while (iterator.HasMoreResults)
+    {
+        var batch = await iterator.ReadNextAsync();
+        user = batch.FirstOrDefault();
+        if (user != null) break;
+    }
+
+    // Vérifie le mot de passe hashé
+    if (user is null || !BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
+        return Results.Unauthorized();
+
+    // Génère le JWT
+    var claims = new[]
+    {
+        new Claim(ClaimTypes.Name, user.Username),
+        new Claim(ClaimTypes.Role, user.Role),
+        new Claim("ClientId", user.ClientId),
+        new Claim("UserId", user.Id)
+    };
+
+    var key = new SymmetricSecurityKey(
+        Encoding.UTF8.GetBytes("MaCleSecreteSuperLongue-MinimumTrentaDeuxCaracteres!"));
+
+    var token = new JwtSecurityToken(
+        issuer: "CiteoPortal",
+        audience: "CiteoClients",
+        claims: claims,
+        expires: DateTime.UtcNow.AddMinutes(30), // courte durée
+        signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256)
+    );
+
+    // Crée un refresh token en base
+    var refreshToken = new RefreshToken
+    {
+        ClientId = user.ClientId,
+        UserId = user.Id,
+        ExpiresAt = DateTime.UtcNow.AddDays(7) // longue durée
+    };
+
+    await container.CreateItemAsync(refreshToken, new PartitionKey(user.ClientId));
+
+    return Results.Ok(new
+    {
+        token = new JwtSecurityTokenHandler().WriteToken(token),
+        refreshToken = refreshToken.Token
+    });
+});
+
+// GET /orders/mine — Retourne les commandes du client authentifié
+app.MapGet("/orders/mine", async (ClaimsPrincipal user, IOrderRepository repo) =>
+{
+    var clientId = user.FindFirst("ClientId")?.Value;
+    if (clientId is null) return Results.Forbid();
+
+    var orders = await repo.GetByClientAsync(clientId);
+    return Results.Ok(orders);
+}).RequireAuthorization();
 
 app.Run();
